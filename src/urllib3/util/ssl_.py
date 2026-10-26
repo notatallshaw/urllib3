@@ -37,6 +37,11 @@ ALPN_PROTOCOLS = ["http/1.1"]
 DEFAULT_CIPHERS = MOZ_INTERMEDIATE_CIPHERS
 
 _TYPE_VERSION_INFO = typing.Tuple[int, int, int, str, int]
+_ContextCachePart = typing.Union[
+    None, str, bytes, int, typing.Tuple["_ContextCachePart", ...]
+]
+_ContextCacheKey = typing.Tuple[_ContextCachePart, ...]
+_CONTEXT_CACHE_SECRET_HASH = hmac.new(os.urandom(32), digestmod=hashlib.sha256)
 
 IS_PYOPENSSL = False  # kept for BC reason
 
@@ -51,33 +56,42 @@ HASHFUNC_MAP = {
 }
 
 
+def _context_cache_secret(value: str | bytes | None) -> bytes | None:
+    """Fingerprint sensitive cache inputs with a process-local key."""
+    if value is None:
+        return None
+
+    digest = _CONTEXT_CACHE_SECRET_HASH.copy()
+    if isinstance(value, str):
+        digest.update(b"str")
+        digest.update(str.encode(value, "utf-8", "surrogatepass"))
+    else:
+        digest.update(b"bytes")
+        digest.update(value)
+    return digest.digest()
+
+
 def _compute_key_ctx_build(
     *args: str | bytes | int | Path | list[str] | bool | dict[str, typing.Any] | None,
-) -> int:
-    """We want a dedicated hashing techniques to cache ssl ctx, so that they are reusable across the runtime."""
-    key: str = ""
+    certdata: str | bytes | None = None,
+    keydata: str | bytes | None = None,
+    key_password: str | None = None,
+) -> _ContextCacheKey:
+    """Build exact cache parts and process-keyed sensitive input fingerprints."""
+    key: list[_ContextCachePart] = []
 
     for arg in args:
         if arg is None:
-            key += "\x00"
-            continue
-        if isinstance(
-            arg,
-            (
-                str,
-                bytes,
-            ),
-        ):
-            key += str(hash(arg))
-            continue
-        if isinstance(arg, Path):
-            # a file/directory may change at any moment
-            # we must have a clue if the key cache
-            # must be invalidated.
-            key += str(arg)
+            key.append(None)
+        elif isinstance(arg, str):
+            key.append(("str", str.__str__(arg)))
+        elif isinstance(arg, bytes):
+            key.append(("bytes", arg[:]))
+        elif isinstance(arg, Path):
+            modified: str | None = None
             if arg.is_dir():
                 try:
-                    key += str(
+                    modified = str(
                         max(
                             [arg.stat().st_mtime]
                             + [p.stat().st_mtime for p in arg.iterdir()],
@@ -88,29 +102,41 @@ def _compute_key_ctx_build(
                     pass
             else:
                 try:
-                    key += str(Path(arg).stat().st_mtime)
+                    modified = str(Path(arg).stat().st_mtime)
                 except OSError:
                     pass  # Defensive: race condition possible
-        if isinstance(arg, (int, bool)):
-            key += str(arg)
-            continue
-        if isinstance(arg, dict):
-            key += str(arg)
-            continue
-        if isinstance(arg, list):
-            key += "("
-            for item in arg:
-                key += item
-            key += ")"
+            key.append(("path", str(arg), modified))
+        elif isinstance(arg, bool):
+            key.append(("bool", arg))
+        elif isinstance(arg, int):
+            key.append(("int", int.__int__(arg)))
+        elif isinstance(arg, dict):
+            key.append(("dict", _context_cache_secret(str(arg))))
+        else:
+            key.append(("list", tuple(str.__str__(item) for item in arg)))
 
-    return hash(key)
+    key.append(("certdata", _context_cache_secret(certdata)))
+    key.append(("keydata", _context_cache_secret(keydata)))
+    key.append(("key_password", _context_cache_secret(key_password)))
+    return tuple(key)
+
+
+def _redact_context_cache_part(value: _ContextCachePart) -> _ContextCachePart:
+    """Keep private PEM blocks out of retained public input fields."""
+    if isinstance(value, str) and "PRIVATE KEY" in value:
+        return ("private-pem", _context_cache_secret(value))
+    if isinstance(value, bytes) and b"PRIVATE KEY" in value:
+        return ("private-pem", _context_cache_secret(value))
+    if isinstance(value, tuple):
+        return tuple(_redact_context_cache_part(item) for item in value)
+    return value
 
 
 class _CacheableSSLContext:
     def __init__(self, maxsize: int | None = 32) -> None:
         self._maxsize = maxsize
-        self._container: dict[int, ssl.SSLContext] = {}
-        self._cursor: int | None = None
+        self._container: dict[_ContextCacheKey, ssl.SSLContext] = {}
+        self._cursor: _ContextCacheKey | None = None
         self._lock: threading.RLock = threading.RLock()
 
     def clear(self) -> None:
@@ -129,9 +155,24 @@ class _CacheableSSLContext:
         | bool
         | dict[str, typing.Any]
         | None,
+        certdata: str | bytes | None = None,
+        keydata: str | bytes | None = None,
+        key_password: str | None = None,
+        cache_disabled: bool = False,
     ) -> typing.Generator[None]:
-        key = _compute_key_ctx_build(*args)
+        if cache_disabled:
+            # Caller-owned contexts still need serialized configuration.
+            with self._lock:
+                yield
+            return
+
+        key = _compute_key_ctx_build(
+            *args, certdata=certdata, keydata=keydata, key_password=key_password
+        )
         with self._lock:
+            # Avoid rescanning ordinary public inputs on cache hits.
+            if key not in self._container:
+                key = tuple(_redact_context_cache_part(part) for part in key)
             self._cursor = key
             try:
                 yield
@@ -757,15 +798,16 @@ def ssl_wrap_socket(
         ciphers,
         ca_cert_dir if ca_cert_dir is None else Path(ca_cert_dir),
         alpn_protocols,
-        certdata,
-        keydata,
-        key_password,
         ca_cert_data,
         os.getenv("SSLKEYLOGFILE", None),
         ssl_minimum_version,
         ssl_maximum_version,
         check_hostname,
         ssl_backend,
+        certdata=certdata,
+        keydata=keydata,
+        key_password=key_password,
+        cache_disabled=cache_disabled,
     ):
         cached_ctx = _SSLContextCache.get() if not cache_disabled else None
 
