@@ -1,19 +1,32 @@
 from __future__ import annotations
 
-import ssl
+import asyncio
 import datetime
+import gc
+import os
+import socket
+import ssl
 import threading
 import typing
+import weakref
 from io import UnsupportedOperation
 from unittest import mock
 
 import pytest
 import trustme
+from typing_extensions import override
 
 from urllib3._constant import MOZ_INTERMEDIATE_CIPHERS
 from urllib3.contrib.anytls import ssl as active_ssl
+from urllib3.contrib.ssa import AsyncSocket
 from urllib3.exceptions import ProxySchemeUnsupported, SSLError
 from urllib3.util import ssl_
+from urllib3.util._async import ssl_ as async_ssl
+
+from . import has_alpn
+
+if typing.TYPE_CHECKING:
+    from pathlib import Path
 
 
 def test_in_memory_client_certificate_without_available_method(
@@ -92,6 +105,129 @@ def tls_reader() -> ssl.SSLObject:
     return client
 
 
+@pytest.fixture
+def alpn_tls_server(
+    monkeypatch: pytest.MonkeyPatch,
+) -> typing.Iterator[tuple[tuple[str, int], bytes, list[str | None]]]:
+    """Negotiate three authenticated connections with independently selected ALPN."""
+    if not has_alpn(ssl.SSLContext):
+        pytest.skip("ALPN is unavailable")
+    monkeypatch.delenv("SSLKEYLOGFILE", raising=False)
+    ca = trustme.CA()
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ca.issue_cert("localhost").configure_cert(context)
+    context.set_alpn_protocols(["h2", "http/1.1", "h2http/1.1"])
+    selected: list[str | None] = []
+    errors: list[OSError] = []
+
+    with socket.socket() as listener:
+        host = "127.0.0.1"
+        listener.bind((host, 0))
+        listener.listen()
+        listener.settimeout(5)
+        port = listener.getsockname()[1]
+        ca_data = ca.cert_pem.bytes()
+        assert isinstance(port, int)
+        assert isinstance(ca_data, bytes)
+
+        def serve() -> None:
+            try:
+                for _ in range(3):
+                    raw, _ = listener.accept()
+                    raw.settimeout(5)
+                    with raw, context.wrap_socket(raw, server_side=True) as connection:
+                        selected.append(connection.selected_alpn_protocol())
+                        connection.sendall(b"x")
+            except OSError as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=serve)
+        thread.start()
+        try:
+            yield (host, port), ca_data, selected
+        finally:
+            listener.close()
+            thread.join(10)
+            assert not thread.is_alive()
+            assert not errors
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize(
+    ("vectors", "expected"),
+    [
+        (
+            [["h2", "http/1.1"], ["h2http/1.1"], ["h2", "http/1.1"]],
+            ["h2", "h2http/1.1", "h2"],
+        ),
+        (
+            [["h2http/1.1"], ["h2", "http/1.1"], ["h2http/1.1"]],
+            ["h2http/1.1", "h2", "h2http/1.1"],
+        ),
+    ],
+    ids=["forward", "reverse"],
+)
+async def test_tls_context_cache_preserves_alpn(
+    *,
+    alpn_tls_server: tuple[tuple[str, int], bytes, list[str | None]],
+    asynchronous: bool,
+    vectors: list[list[str]],
+    expected: list[str],
+) -> None:
+    address, ca_data, server_selected = alpn_tls_server
+    cache = async_ssl._SSLContextCache if asynchronous else ssl_._SSLContextCache
+    selected: list[str | None] = []
+    contexts: list[ssl.SSLContext] = []
+    cache.clear()
+    try:
+        for protocols in vectors:
+            if asynchronous:
+                client = AsyncSocket()
+                client.settimeout(5)
+                try:
+                    await client.connect(address)
+                    wrapped = await async_ssl.ssl_wrap_socket(
+                        client,
+                        ca_cert_data=ca_data,
+                        server_hostname="localhost",
+                        alpn_protocols=protocols,
+                        ssl_backend="ssl",
+                    )
+                    selected.append(wrapped.selected_alpn_protocol())
+                    actual_context = wrapped.context
+                    assert await wrapped.recv(1) == b"x"
+                finally:
+                    client.close()
+                    await asyncio.sleep(0)
+            else:
+                with socket.create_connection(
+                    address, timeout=5
+                ) as raw, ssl_.ssl_wrap_socket(
+                    raw,
+                    ca_cert_data=ca_data,
+                    server_hostname="localhost",
+                    alpn_protocols=protocols,
+                    ssl_backend="ssl",
+                ) as wrapped_sync:
+                    selected.append(wrapped_sync.selected_alpn_protocol())
+                    actual_context = wrapped_sync.context
+                    assert wrapped_sync.recv(1) == b"x"
+
+            assert isinstance(actual_context, ssl.SSLContext)
+            contexts.append(actual_context)
+            assert actual_context.check_hostname
+            assert actual_context.verify_mode == ssl.CERT_REQUIRED
+            assert actual_context.cert_store_stats()["x509_ca"] == 1
+
+        assert selected == expected
+        assert server_selected == expected
+        assert contexts[0] is not contexts[1]
+        assert contexts[0] is contexts[2]
+    finally:
+        cache.clear()
+
+
 class TestSSL:
     @pytest.mark.parametrize(
         "value,expected",
@@ -125,6 +261,210 @@ class TestSSL:
         with cache.lock({"option": "one"}):
             assert cache.get() is context
         with cache.lock({"option": "two"}):
+            assert cache.get() is None
+
+    def test_disabled_context_cache_preserves_nested_cursor(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cache = ssl_._CacheableSSLContext()
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+
+        def unexpected_key(*_args: object, **_kwargs: object) -> typing.NoReturn:
+            raise AssertionError("Disabled caches must not build a key")
+
+        with monkeypatch.context() as disabled_patch:
+            disabled_patch.setattr(ssl_, "_compute_key_ctx_build", unexpected_key)
+            with cache.lock("disabled", cache_disabled=True):
+                assert cache._cursor is None
+
+        with cache.lock("outer"):
+            cache.save(context)
+            cursor = cache._cursor
+            with cache.lock("disabled", cache_disabled=True), cache.lock(
+                "nested-disabled", cache_disabled=True
+            ):
+                assert cache._cursor is cursor
+                assert cache.get() is context
+            assert cache._cursor is cursor
+            assert cache.get() is context
+        assert cache._cursor is None
+
+        with cache.lock("disabled", cache_disabled=True):
+            assert cache._cursor is None
+            with cache.lock("inner"):
+                cache.save(context)
+            assert cache._cursor is None
+
+    def test_disabled_context_cache_keeps_configuration_lock(self) -> None:
+        cache = ssl_._CacheableSSLContext()
+        acquired = []
+
+        def attempt() -> None:
+            locked = cache._lock.acquire(blocking=False)
+            acquired.append(locked)
+            if locked:
+                cache._lock.release()
+
+        with cache.lock("disabled", cache_disabled=True):
+            thread = threading.Thread(target=attempt)
+            thread.start()
+            thread.join(5)
+            assert not thread.is_alive()
+            assert acquired == [False]
+
+    @pytest.mark.parametrize(
+        ("left", "right"),
+        [
+            ((["h2", "http/1.1"],), (["h2http/1.1"],)),
+            ((["ab", "c"],), (["a", "bc"],)),
+            ((1, 23), (12, 3)),
+            ((-1,), (-2,)),
+            (("value",), (b"value",)),
+            ((None,), ("",)),
+            ((None,), ([],)),
+            (([],), ([""],)),
+        ],
+    )
+    def test_context_cache_distinguishes_settings(
+        self,
+        left: tuple[str | bytes | int | list[str] | None, ...],
+        right: tuple[str | bytes | int | list[str] | None, ...],
+    ) -> None:
+        cache = ssl_._CacheableSSLContext()
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        for stored, other in ((left, right), (right, left)):
+            cache.clear()
+            with cache.lock(*stored):
+                cache.save(context)
+            with cache.lock(*other):
+                assert cache.get() is None
+            with cache.lock(*stored):
+                assert cache.get() is context
+
+    def test_context_cache_distinguishes_equal_hash_strings(self) -> None:
+        class EqualHashString(str):
+            __slots__ = ()
+
+            @override
+            def __hash__(self) -> int:
+                return 0
+
+        cache = ssl_._CacheableSSLContext()
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        with cache.lock(EqualHashString("DEFAULT")):
+            cache.save(context)
+        with cache.lock(EqualHashString("ALL")):
+            assert cache.get() is None
+        with cache.lock("DEFAULT"):
+            assert cache.get() is context
+
+    def test_context_cache_distinguishes_private_key_settings(self) -> None:
+        cache = ssl_._CacheableSSLContext()
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        with cache.lock("settings", keydata=b"key-one", key_password="password-one"):
+            cache.save(context)
+        with cache.lock("settings", keydata=b"key-two", key_password="password-one"):
+            assert cache.get() is None
+        with cache.lock("settings", keydata=b"key-one", key_password="password-two"):
+            assert cache.get() is None
+        with cache.lock("settings", keydata="key-one", key_password="password-one"):
+            assert cache.get() is None
+        with cache.lock(
+            "settings",
+            certdata="certificate",
+            keydata=b"key-one",
+            key_password="password-one",
+        ):
+            assert cache.get() is None
+        with cache.lock("settings", keydata=b"key-one", key_password="password-one"):
+            assert cache.get() is context
+
+    def test_context_cache_does_not_retain_private_key_inputs(self) -> None:
+        class Secret(str):
+            __slots__ = ("__weakref__",)
+
+        certificate = Secret("private-certificate-value")
+        key = Secret("private-key-material")
+        password = Secret("private-key-password")
+        certificate_ref = weakref.ref(certificate)
+        key_ref, password_ref = weakref.ref(key), weakref.ref(password)
+        cache = ssl_._CacheableSSLContext()
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        with cache.lock(
+            "settings", certdata=certificate, keydata=key, key_password=password
+        ):
+            cache.save(context)
+        assert key not in repr(cache._container)
+        assert password not in repr(cache._container)
+        assert certificate not in repr(cache._container)
+
+        del certificate, key, password
+        gc.collect()
+        assert key_ref() is None
+        assert password_ref() is None
+        assert certificate_ref() is None
+
+    def test_context_cache_reuses_public_inputs_without_redaction(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cache = ssl_._CacheableSSLContext()
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        public = b"public certificate data"
+        with cache.lock(public):
+            cache.save(context)
+
+        def unexpected_redaction(_part: typing.Hashable) -> typing.NoReturn:
+            raise AssertionError("Cached public data must not be scanned again")
+
+        monkeypatch.setattr(ssl_, "_redact_context_cache_part", unexpected_redaction)
+        with cache.lock(public):
+            assert cache.get() is context
+
+    def test_context_cache_does_not_retain_dictionary_options(self) -> None:
+        cache = ssl_._CacheableSSLContext()
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        options = {"password": "private-dictionary-value"}
+        with cache.lock(options):
+            cache.save(context)
+        with cache.lock(options):
+            assert cache.get() is context
+        assert options["password"] not in repr(cache._container)
+
+    @pytest.mark.parametrize("text", [False, True])
+    def test_context_cache_redacts_private_pem_values(self, *, text: bool) -> None:
+        private = trustme.CA().private_key_pem.bytes()
+        assert isinstance(private, bytes)
+        value = private.decode() if text else private
+        cache = ssl_._CacheableSSLContext()
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        with cache.lock(value):
+            cache.save(context)
+        with cache.lock(value):
+            assert cache.get() is context
+        assert len(cache._container) == 1
+        assert "PRIVATE KEY" not in repr(cache._container)
+
+    @pytest.mark.parametrize("directory", [False, True])
+    def test_context_cache_invalidates_changed_path(
+        self, *, tmp_path: Path, directory: bool
+    ) -> None:
+        path = tmp_path / "certificates"
+        if directory:
+            path.mkdir()
+            changed = path / "certificate.pem"
+        else:
+            changed = path
+        changed.write_bytes(b"certificate")
+        cache = ssl_._CacheableSSLContext()
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        with cache.lock(path):
+            cache.save(context)
+        with cache.lock(path):
+            assert cache.get() is context
+
+        modified = max(path.stat().st_mtime, changed.stat().st_mtime) + 1
+        os.utime(changed, (modified, modified))
+        with cache.lock(path):
             assert cache.get() is None
 
     @pytest.mark.parametrize("fallback", [False, True])

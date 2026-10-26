@@ -94,15 +94,16 @@ async def ssl_wrap_socket(
         ciphers,
         ca_cert_dir if ca_cert_dir is None else Path(ca_cert_dir),
         alpn_protocols,
-        certdata,
-        keydata,
-        key_password,
         ca_cert_data,
         os.getenv("SSLKEYLOGFILE", None),
         ssl_minimum_version,
         ssl_maximum_version,
         check_hostname,
         ssl_backend,
+        certdata=certdata,
+        keydata=keydata,
+        key_password=key_password,
+        cache_disabled=cache_disabled,
     ):
         cached_ctx = _SSLContextCache.get() if not cache_disabled else None
 
