@@ -12,8 +12,10 @@ import trustme
 
 from urllib3._constant import MOZ_INTERMEDIATE_CIPHERS
 from urllib3.contrib.anytls import ssl as active_ssl
+from urllib3.contrib.ssa import AsyncSocket
 from urllib3.exceptions import ProxySchemeUnsupported, SSLError
 from urllib3.util import ssl_
+from urllib3.util._async import ssl_ as async_ssl
 
 
 def test_in_memory_client_certificate_without_available_method(
@@ -30,6 +32,77 @@ def test_in_memory_client_certificate_without_available_method(
             client.cert_chain_pems[0].bytes(),
             client.private_key_pem.bytes(),
         )
+
+
+def test_stdlib_context_detection_excludes_alternative_backends() -> None:
+    class AlternativeContext(ssl.SSLContext):
+        def set_ech_configs(self, _config: bytes) -> None:
+            pass
+
+    assert ssl_._is_stdlib_ssl_context(ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT))
+    assert not ssl_._is_stdlib_ssl_context(AlternativeContext(ssl.PROTOCOL_TLS_CLIENT))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("supplied_context", [False, True])
+async def test_in_memory_client_certificate_uses_context_backend(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    asynchronous: bool,
+    supplied_context: bool,
+) -> None:
+    certdata = b"certificate"
+    keydata = b"private key"
+    password = "password"
+    loaded: list[tuple[ssl.SSLContext, bytes, bytes, str]] = []
+
+    class Loaded(Exception):
+        pass
+
+    def load_cert_chain(
+        context: ssl.SSLContext,
+        cert: bytes,
+        key: bytes,
+        key_password: str,
+    ) -> typing.NoReturn:
+        loaded.append((context, cert, key, key_password))
+        raise Loaded
+
+    context = (
+        ssl_.create_urllib3_context(ssl_backend="ssl") if supplied_context else None
+    )
+    # Model an installed alternate default without requiring its wheel in this suite.
+    monkeypatch.setattr(ssl_, "IS_NONSTDLIB", True)
+    monkeypatch.setattr(async_ssl, "IS_NONSTDLIB", True, raising=False)
+
+    # The loader sentinel stops both paths before either uninitialized socket is used.
+    if asynchronous:
+        monkeypatch.setattr(async_ssl, "_ctx_load_cert_chain", load_cert_chain)
+        with pytest.raises(Loaded):
+            await async_ssl.ssl_wrap_socket(
+                object.__new__(AsyncSocket),
+                ssl_context=context,
+                certdata=certdata,
+                keydata=keydata,
+                key_password=password,
+                ssl_backend="rtls" if supplied_context else "ssl",
+            )
+    else:
+        monkeypatch.setattr(ssl_, "_ctx_load_cert_chain", load_cert_chain)
+        with pytest.raises(Loaded):
+            ssl_.ssl_wrap_socket(
+                ssl.SSLSocket.__new__(ssl.SSLSocket),
+                ssl_context=context,
+                certdata=certdata,
+                keydata=keydata,
+                key_password=password,
+                ssl_backend="rtls" if supplied_context else "ssl",
+            )
+
+    assert len(loaded) == 1
+    assert loaded[0][1:] == (certdata, keydata, password)
+    assert type(loaded[0][0]).__module__ == "ssl"
 
 
 @pytest.fixture
