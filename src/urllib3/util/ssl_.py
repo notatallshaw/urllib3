@@ -51,6 +51,19 @@ HASHFUNC_MAP = {
 }
 
 
+def _is_stdlib_ssl_context(context: object) -> bool:
+    """Return whether a context uses the standard-library TLS implementation."""
+    # rtls and utls inherit from SSLContext but expose this backend-specific method.
+    return (
+        not hasattr(context, "set_ech_configs")
+        and stdlib_ssl is not None
+        and isinstance(
+            context,
+            getattr(stdlib_ssl, "_SSLContext", stdlib_ssl.SSLContext),
+        )
+    )
+
+
 def _compute_key_ctx_build(
     *args: str | bytes | int | Path | list[str] | bool | dict[str, typing.Any] | None,
 ) -> int:
@@ -824,7 +837,8 @@ def ssl_wrap_socket(
                 else:
                     context.load_cert_chain(certfile, keyfile, key_password)
             elif certdata and keydata:
-                if IS_NONSTDLIB:
+                # A forced or caller-owned context can differ from the active backend.
+                if not _is_stdlib_ssl_context(context):
                     context.load_cert_chain(certdata, keydata, key_password)
                 else:
                     try:
@@ -946,14 +960,7 @@ _T = typing.TypeVar("_T")
 
 
 def _inspect_cert_store(ctx: ssl.SSLContext, operation: typing.Callable[[], _T]) -> _T:
-    # rtls/utls contexts also inherit from stdlib SSLContext for compatibility.
-    if (
-        hasattr(ctx, "set_ech_configs")
-        or stdlib_ssl is None
-        or not isinstance(
-            ctx, getattr(stdlib_ssl, "_SSLContext", stdlib_ssl.SSLContext)
-        )
-    ):
+    if not _is_stdlib_ssl_context(ctx):
         return operation()
 
     clear_error = _get_clear_error()

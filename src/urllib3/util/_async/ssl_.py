@@ -9,7 +9,7 @@ from pathlib import Path
 if typing.TYPE_CHECKING:
     from typing_extensions import Literal
 
-from ...contrib.anytls import ssl, IS_NONSTDLIB
+from ...contrib.anytls import ssl
 
 from ...contrib.imcc import load_cert_chain as _ctx_load_cert_chain
 from ...contrib.ssa import AsyncSocket, SSLAsyncSocket
@@ -19,6 +19,7 @@ from ..ssl_ import (
     _CacheableSSLContext,
     _cert_store_stats,
     _is_key_file_encrypted,
+    _is_stdlib_ssl_context,
     create_urllib3_context,
 )
 
@@ -157,7 +158,8 @@ async def ssl_wrap_socket(
                 else:
                     context.load_cert_chain(certfile, keyfile, key_password)
             elif certdata and keydata:
-                if IS_NONSTDLIB:
+                # A forced or caller-owned context can differ from the active backend.
+                if not _is_stdlib_ssl_context(context):
                     context.load_cert_chain(certdata, keydata, key_password)
                 else:
                     try:

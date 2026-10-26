@@ -1,0 +1,1 @@
+Fixed in-memory client certificate data being treated as file paths when a standard-library SSL context was used while an alternative TLS backend was active.
